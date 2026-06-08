@@ -2,3 +2,6 @@ discord.py
 google-genai
 python-dotenv
 flask
+gTTS
+PyNaCl
+static-ffmpeg
