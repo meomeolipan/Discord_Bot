@@ -1,153 +1,93 @@
 import discord
 import os
-import sys
-import logging
 import asyncio
+import logging
 from discord.ext import commands
 from dotenv import load_dotenv
 from google import genai
-
-# TTS(음성 송출)를 위한 필수 패키지
+from google.genai import types
 from gtts import gTTS
 import static_ffmpeg
 
-# 렌더 서버에서 음성 송출 도구(FFmpeg) 경로를 인식하도록 설정
+# 렌더 서버 환경 설정
 static_ffmpeg.add_paths()
-
-# 상위 폴더 경로 추가 (keep_alive.py 위치 찾기)
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# 렌더용 24시간 호스팅 스위치
-from keep_alive import keep_alive 
-
-# ==========================================
-# 1. 환경 변수 및 설정
-# ==========================================
 load_dotenv()
-discord_token = os.getenv('DISCORD_TOKEN')
-gemini_api_key = os.getenv('GEMINI_API_KEY')
 
-# 제미나이 클라이언트 생성
-client = genai.Client(api_key=gemini_api_key)
+# 환경 변수
+BOT_TOKEN = os.getenv('DISCORD_TOKEN')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+VOICE_CHANNEL_ID = int(os.getenv('VOICE_CHANNEL_ID', 0))
 
-handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
-
+client = genai.Client(api_key=GEMINI_API_KEY)
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # 음성 채널 접속을 위해 필수
+intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ==========================================
-# 2. 봇 접속 완료 알림
-# ==========================================
+# 자동 퇴장 타이머 변수
+disconnect_task = None
+
+async def voice_disconnect_after_delay(vc, delay=10.0):
+    await asyncio.sleep(delay)
+    if vc and vc.is_connected():
+        await vc.disconnect()
+
 @bot.event
 async def on_ready():
-    print(f'✅ 디스코드 봇 로그인 완료: {bot.user.name}')
+    print(f'✅ 봇 로그인 완료: {bot.user.name}')
 
-# ==========================================
-# 3. 제미나이 AI 텍스트 답변 기능 (!질문)
-# ==========================================
 @bot.event
 async def on_message(message):
-    # 봇 자신의 메시지는 무시
-    if message.author == bot.user:
+    global disconnect_task
+    if message.author.bot: return
+
+    # 1. AI 명령어 (!질문, !생성) 우선 처리
+    if message.content.startswith(('!질문', '!생성')):
+        await bot.process_commands(message)
         return
 
-    # '!질문 '으로 시작하는 채팅을 쳤을 때
-    if message.content.startswith('!질문 '):
-        user_question = message.content[4:] 
+    # 2. 일반 채팅 실시간 TTS 읽기 (설정된 채널에서만)
+    if message.channel.id == VOICE_CHANNEL_ID and message.author.voice:
+        channel = message.author.voice.channel
         
-        thinking_msg = await message.channel.send("🤔 생각 중...")
-        max_retries = 3 
-        
-        for attempt in range(max_retries):
-            try:
-                response = await client.aio.models.generate_content(
-                    model='gemini-flash-latest', 
-                    contents=user_question,
-                )
-                
-                answer = response.text
-                
-                # 디스코드 글자 수 제한(2000자) 해결: 1900자씩 분할 전송
-                if len(answer) <= 1900:
-                    await thinking_msg.edit(content=answer)
-                else:
-                    await thinking_msg.edit(content=answer[:1900] + "...\n\n*(내용이 길어서 다음 메시지로 이어집니다!)*")
-                    for i in range(1900, len(answer), 1900):
-                        await message.channel.send(answer[i:i+1900])
-                
-                break # 성공했으므로 반복문 탈출
-                
-            except Exception as e:
-                error_str = str(e)
-                
-                # 구글 서버 혼잡(503) 에러 시 친절한 안내 및 5초 대기 후 재시도
-                if "503" in error_str or "UNAVAILABLE" in error_str:
-                    if attempt < max_retries - 1:
-                        await thinking_msg.edit(content=f"⏳ 구글 서버에 사람이 많네요! 다시 답변을 가져오는 중... (재시도 {attempt+1}/{max_retries})")
-                        await asyncio.sleep(5)
-                    else:
-                        await thinking_msg.edit(content="😅 지금 전 세계적으로 구글 AI 서버가 너무 바빠서 답변을 가져오지 못했어요. 1~2분 뒤에 다시 `!질문` 해주세요!")
-                else:
-                    print(f"오류 발생: {e}") 
-                    await thinking_msg.edit(content="앗, 생각하다가 머리가 꼬였어요! 조금 이따가 다시 질문해 주시겠어요? 🥲")
-                    break
+        # 봇 연결 확인
+        if bot.voice_clients == []:
+            vc = await channel.connect()
+        else:
+            vc = bot.voice_clients[0]
+            if vc.channel != channel: await vc.move_to(channel)
 
-    # 중요: on_message 이벤트 안에서 아래 코드를 호출해야 다른 명령어(!tts 등)가 정상 작동함.
+        # 타이머 초기화
+        if disconnect_task: disconnect_task.cancel()
+
+        # TTS 생성 및 재생
+        tts = gTTS(text=message.content, lang='ko')
+        file_name = f"tts_{message.author.id}.mp3"
+        tts.save(file_name)
+        
+        if vc.is_playing(): vc.stop()
+        vc.play(discord.FFmpegPCMAudio(file_name), after=lambda e: os.remove(file_name))
+        
+        disconnect_task = asyncio.create_task(voice_disconnect_after_delay(vc))
+
     await bot.process_commands(message)
 
-# ==========================================
-# 4. 음성 채널 TTS 기능 (!tts 할말)
-# ==========================================
-@bot.command(name="tts")
-async def speak_tts(ctx, *, text: str):
-    # 사용자가 음성 채널에 들어가 있는지 확인
-    if not ctx.author.voice:
-        await ctx.send("😅 먼저 수다 채널(음성 채널)에 들어가신 후 명령어를 입력해주세요!")
-        return
+# AI 답변 기능
+@bot.command(name="질문")
+async def ask_ai(ctx, *, question: str):
+    thinking = await ctx.send("🤔 생각 중...")
+    config = types.GenerateContentConfig(system_instruction="핵심만 500자 이내로 간결하고 귀엽게 답변해.")
+    response = await client.aio.models.generate_content(model='gemini-flash-latest', contents=question, config=config)
+    await thinking.edit(content=response.text)
 
-    voice_channel = ctx.author.voice.channel
+# 이미지 생성 기능
+@bot.command(name="생성")
+async def generate_image(ctx, *, prompt: str):
+    await ctx.send(f"🎨 '{prompt}' 그리는 중...")
+    response = client.models.generate_images(model='imagen-3.0-generate-001', prompt=prompt, number_of_images=1)
+    embed = discord.Embed(title=f"'{prompt}' 완성!")
+    embed.set_image(url=response.generated_images[0].image.image_url)
+    await ctx.send(embed=embed)
 
-    # 봇을 음성 채널로 부르기
-    if ctx.voice_client is None:
-        vc = await voice_channel.connect()
-    else:
-        vc = ctx.voice_client
-        await vc.move_to(voice_channel)
-
-    # 텍스트를 mp3 파일로 변환
-    tts = gTTS(text=text, lang='ko')
-    file_name = f"tts_{ctx.author.id}.mp3"
-    tts.save(file_name)
-
-    # 음성 송출
-    if not vc.is_playing():
-        await ctx.send(f"🗣️ 봇이 읽어줍니다: `{text}`")
-        vc.play(discord.FFmpegPCMAudio(file_name))
-        
-        # 말이 끝날 때까지 대기 후 파일 삭제
-        while vc.is_playing():
-            await asyncio.sleep(1)
-        os.remove(file_name)
-    else:
-        await ctx.send("잠시만요! 아직 다른 말을 하고 있어요.")
-        os.remove(file_name) # 혹시 파일이 꼬이는 것을 방지해 삭제
-
-# ==========================================
-# 5. 음성 채널 퇴장 기능 (!나가)
-# ==========================================
-@bot.command(name="나가")
-async def leave_voice(ctx):
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("👋 수다를 마치고 채널에서 나갑니다!")
-    else:
-        await ctx.send("저 지금 아무 채널에도 없는데요?")
-
-# ==========================================
-# 6. 24시간 호스팅 실행
-# ==========================================
-keep_alive()
-bot.run(discord_token, log_handler=handler)
+bot.run(BOT_TOKEN)
