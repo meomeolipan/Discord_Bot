@@ -12,9 +12,8 @@ from google import genai
 # 부모 폴더(Discord_bot) 경로를 추가하여 keep_alive.py를 찾을 수 있게 함
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 💡 현재 내 컴퓨터에서 당장 테스트할 때는 아래 한 줄을 # 으로 주석 처리하세요. 
-# (나중에 Render 서버에 올릴 때만 #을 지우고 사용합니다!)
-# from keep_alive import keep_alive
+# (나중에 Render 서버에 올릴 때만 #을 지우고 사용!)
+from keep_alive import keep_alive
 
 load_dotenv()
 discord_token = os.getenv('DISCORD_TOKEN')
@@ -52,7 +51,7 @@ async def on_message(message):
         thinking_msg = await message.channel.send("🤔 생각 중...")
         
         try:
-            # 🚨 핵심 수정: 디스코드 봇이 멈추지 않도록 await와 .aio.를 추가!
+            #디스코드 봇이 멈추지 않도록 await와 .aio.를 추가!
             response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=user_question,
@@ -70,7 +69,7 @@ async def on_message(message):
 # ==========================================
 # 4. 봇 실행
 # ==========================================
-# 💡 아래 keep_alive() 도 현재 컴퓨터 테스트 중에는 # 으로 꺼두세요!
-# keep_alive()
+# 💡 아래 keep_alive() 도 현재 컴퓨터 테스트 중에는 # 으로 꺼야함.
+keep_alive()
 
 bot.run(discord_token, log_handler=handler)
